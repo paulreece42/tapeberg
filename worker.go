@@ -108,6 +108,12 @@ func RunWorker(cfg Config) error {
 			table, "'"+map[string]string{"archive_requests": "assigned", "retrieve_requests": "restoring"}[table]+"'", cfg.StaleJobMinutes)
 		res, err := db.Exec(q)
 		if err != nil {
+			// Loud, not silent: a failed re-apply usually means the
+			// catalog predates migration 0012 — with the error
+			// swallowed, a stale-migration box just skips recovery
+			// forever (seen on the production rig while migrations
+			// lagged the deployed binary).
+			fmt.Printf("worker: stale-job reap FAILED (%s): %v — is migration 0012 applied?\n", table, err)
 			return -1
 		}
 		n, _ := res.RowsAffected()

@@ -49,7 +49,52 @@ func (o *Object) etagOf() string {
 
 func bucketID(db *sql.DB) (int64, error) { return bucketIDByName(db, "tapeberg") }
 
-func bucketIDByName(db *sql.DB, name string) (int64, error) {
+// dbi is what catalog helpers talk to: *sql.DB for plain statements,
+// *sql.Tx inside withTx-scoped lanes (multipart parts, ingest).
+type dbi interface {
+	Exec(query string, args ...any) (sql.Result, error)
+	QueryRow(query string, args ...any) *sql.Row
+}
+
+// withTx wraps fn in a catalog transaction: commit on nil, rollback on
+// error. The part lanes used to run 2-5 standalone UPDATE/INSERTs with
+// an fsync between each — a crash split them (issues #34/#36/#38).
+func withTx(db *sql.DB, fn func(tx *sql.Tx) error) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	if err := fn(tx); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+// dropPartTx removes every trace of one multipart part: its queue
+// entries, any tape placement (shard stripe or plain copy), the EC
+// verifier rows and the part row itself. Two callers share it:
+// insertPartTx's re-upload path (which previously left object_shards
+// behind — the stale shard sha256s then beat every new stripe via
+// INSERT .. ON CONFLICT DO NOTHING and the part was unrestorable,
+// issue #34) and completeMultipart's unlisted-part drop (same four
+// deletes, same transaction, issue #37's ordering half). Last: the
+// object_parts row — everything else references it.
+func dropPartTx(q dbi, objectID int64, number int) error {
+	for _, q2 := range []string{
+		`DELETE FROM archive_requests WHERE object_id = $1 AND part_number = $2 AND state IN ('pending','assigned')`,
+		`DELETE FROM tape_files WHERE object_id = $1 AND part_number = $2`,
+		`DELETE FROM object_shards WHERE object_id = $1 AND part_number = $2`,
+		`DELETE FROM object_parts WHERE object_id = $1 AND part_number = $2`,
+	} {
+		if _, err := q.Exec(q2, objectID, number); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func bucketIDByName(db dbi, name string) (int64, error) {
 	var id int64
 	err := db.QueryRow(`SELECT id FROM buckets WHERE name = $1`, name).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -217,7 +262,7 @@ func activeRetrieve(db *sql.DB, objectID int64) (state string, expires time.Time
 }
 
 // insertObject records an already-staged disk copy as a STANDARD object.
-func insertObject(db *sql.DB, bucket, key string, size int64, sha256hex, etag, diskPath string, owner int64) (*Object, error) {
+func insertObject(db dbi, bucket, key string, size int64, sha256hex, etag, diskPath string, owner int64) (*Object, error) {
 	bid, err := bucketIDByName(db, bucket)
 	if err != nil {
 		return nil, err
@@ -243,7 +288,7 @@ func isUniqueViolation(err error) bool {
 
 // ---- archive queue ----
 
-func createArchiveRequest(db *sql.DB, objectID int64, pool string, part int) error {
+func createArchiveRequest(db dbi, objectID int64, pool string, part int) error {
 	_, err := db.Exec(`INSERT INTO archive_requests (object_id, pool, part_number) VALUES ($1, $2, $3)`, objectID, pool, part)
 	return err
 }
@@ -789,23 +834,29 @@ func objectByUpload(db *sql.DB, bucket, key, uploadID string) (int64, int64, err
 }
 
 // insertPart records an uploaded part. Re-uploading a part number
-// replaces it: any pending archive request is dropped and an already
-// written tape file becomes dead space on that tape (v0 has no
-// reclamation; the catalog row is removed so it is never read).
-func insertPart(db *sql.DB, objectID int64, number int, size int64, md5, sha, diskPath string) error {
-	if _, err := db.Exec(`DELETE FROM archive_requests
-		WHERE object_id = $1 AND part_number = $2 AND state IN ('pending','assigned')`, objectID, number); err != nil {
-		return err
+// replaces it ATOMICALLY: the queue entries, any tape placement (with
+// its EC shard stripe), the EC verifier rows and the previous part row
+// all go in one transaction with the new row — the old code never
+// touched object_shards, so the new stripe's verifiers lost their
+// ON CONFLICT to the stale ones and the part was unrestorable (#34), a
+// crash between the four statements left it half-dropped (#36), and
+// the caller queues the re-archiving inside the same transaction now
+// (#36). Returns the replaced part's staged disk path so the caller
+// can unlink it after commit.
+func insertPartTx(tx *sql.Tx, objectID int64, number int, size int64, md5, sha, diskPath string) (string, error) {
+	var old string
+	if err := tx.QueryRow(`SELECT COALESCE(disk_path,'') FROM object_parts
+		WHERE object_id = $1 AND part_number = $2`, objectID, number).Scan(&old); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return "", err
 	}
-	if _, err := db.Exec(`DELETE FROM tape_files WHERE object_id = $1 AND part_number = $2`, objectID, number); err != nil {
-		return err
+	if err := dropPartTx(tx, objectID, number); err != nil {
+		return "", err
 	}
-	if _, err := db.Exec(`DELETE FROM object_parts WHERE object_id = $1 AND part_number = $2`, objectID, number); err != nil {
-		return err
+	if _, err := tx.Exec(`INSERT INTO object_parts (object_id, part_number, size_bytes, md5, sha256, disk_path)
+		VALUES ($1, $2, $3, $4, $5, $6)`, objectID, number, size, md5, sha, diskPath); err != nil {
+		return "", err
 	}
-	_, err := db.Exec(`INSERT INTO object_parts (object_id, part_number, size_bytes, md5, sha256, disk_path)
-		VALUES ($1, $2, $3, $4, $5, $6)`, objectID, number, size, md5, sha, diskPath)
-	return err
+	return old, nil
 }
 
 func listParts(db *sql.DB, objectID int64) ([]PartRow, error) {
@@ -836,7 +887,7 @@ func isMultipart(db *sql.DB, objectID int64) (bool, error) {
 // (md5-of-md5s-N) lives in objects.etag; there is deliberately no
 // whole-file sha256 for multipart objects (the part checksums are
 // the integrity record).
-func completeUpload(db *sql.DB, objectID int64, etag string) error {
+func completeUpload(db dbi, objectID int64, etag string) error {
 	_, err := db.Exec(`UPDATE objects SET upload_id = NULL, etag = $2,
 		size_bytes = (SELECT COALESCE(sum(size_bytes),0) FROM object_parts WHERE object_id = $1)
 		WHERE id = $1`, objectID, etag)

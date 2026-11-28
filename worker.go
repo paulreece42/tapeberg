@@ -246,6 +246,29 @@ func archiveOne(db *sql.DB, cfg Config, ch Changer, req *ArchiveReq) error {
 			}
 			return nil // request terminal; drain continues with the next
 		}
+		// Issue #38: the part may have been RE-UPLOADED while we
+		// streamed it. Its replacement ran insertPartTx, which deleted
+		// this request and re-queued the new bytes — cataloging our
+		// tape copy would claim placement for bytes the catalog no
+		// longer vouches for (and its part row's checksums). Abandon:
+		// our tape copy is dead space until repack reclaims it.
+		var live int
+		if err := db.QueryRow(`SELECT count(*) FROM archive_requests
+			WHERE id=$1 AND state='assigned' AND tape_id=$2`, req.ID, tape.ID).Scan(&live); err != nil {
+			return err
+		}
+		var curPath string
+		_ = db.QueryRow(`SELECT COALESCE(disk_path,'') FROM object_parts
+			WHERE object_id=$1 AND part_number=$2`, req.ObjectID, req.PartNumber).Scan(&curPath)
+		if live == 0 || (curPath != "" && curPath != req.DiskPath) {
+			fmt.Printf("worker: %s part %d superseded mid-write (re-uploaded) — its tape copy becomes dead space\n", req.Key, req.PartNumber)
+			if err := markArchiveWritten(db, req.ID); err != nil && !errors.Is(err, ErrNotFound) {
+				return err
+			}
+			_ = os.Remove(req.DiskPath)
+			_ = ch.Unload()
+			return nil
+		}
 		if err := insertTapeFile(db, tape.ID, req.ObjectID, int64(req.PartNumber), archiveID, physical, req.Size); err != nil {
 			return err
 		}
@@ -257,8 +280,14 @@ func archiveOne(db *sql.DB, cfg Config, ch Changer, req *ArchiveReq) error {
 		}
 		// The part left the disk buffer — its catalog path must go
 		// with it, or the read layer would try the deleted file.
-		if err := setPartDiskPath(db, req.ObjectID, req.PartNumber, ""); err != nil {
-			return err
+		// Only when it still points at OUR bytes: a part re-uploaded
+		// mid-write replaced the row's path with its own temp file
+		// (issue #38); clearing blindly would erase the NEW upload's
+		// live path and lose its bytes to the janitor.
+		if curPath == "" || curPath == req.DiskPath {
+			if err := setPartDiskPath(db, req.ObjectID, req.PartNumber, ""); err != nil {
+				return err
+			}
 		}
 		// GLACIER only once every part of the object is on tape —
 		// a multipart upload may still be streaming parts.

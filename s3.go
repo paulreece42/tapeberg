@@ -32,7 +32,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -888,11 +887,23 @@ func (s *s3srv) putPart(w http.ResponseWriter, r *http.Request, bucket, key stri
 	if err := os.MkdirAll(s.cfg.BufferDir, 0o755); err != nil {
 		return err
 	}
-	dst := filepath.Join(s.cfg.BufferDir, fmt.Sprintf("part-%d-%05d", objID, part))
-	f, err := os.Create(dst)
+	// Stage via CreateTemp with O_EXCL semantics (issue #38): the old
+	// deterministic part-<obj>-<n> path opened with os.Create — truncate
+	// in place. A re-upload of the same part number while the worker was
+	// archiving overwrote the staged bytes under the running tape write
+	// and deleted the new copy out from under it. Unique temp names make
+	// every upload its own file; the catalog row points at the real path.
+	tmp, err := os.CreateTemp(s.cfg.BufferDir, fmt.Sprintf("part-%d-%05d-*", objID, part))
 	if err != nil {
 		return err
 	}
+	dst := tmp.Name()
+	if err := tmp.Chmod(0o644); err != nil { // as os.Create gave under umask 022
+		tmp.Close()
+		os.Remove(dst)
+		return err
+	}
+	f := tmp
 	mh, sh := md5.New(), sha256.New()
 	size, err := io.Copy(io.MultiWriter(f, mh, sh), requestBody(r))
 	cerr := f.Close()
@@ -914,13 +925,26 @@ func (s *s3srv) putPart(w http.ResponseWriter, r *http.Request, bucket, key stri
 			fmt.Sprintf("part size %d exceeds the configured maximum %d (TAPEBERG_PART_MAX_BYTES)", size, s.cfg.PartMaxBytes),
 			http.StatusBadRequest)
 	}
-	if err := insertPart(s.db, objID, part, size,
-		hex.EncodeToString(mh.Sum(nil)), hex.EncodeToString(sh.Sum(nil)), dst); err != nil {
+	// Record the part AND re-queue its archiving in one transaction
+	// (issue #36): the old two-step could crash between them, leaving a
+	// live part with no queue entry and no retry. The replaced part's
+	// staged/derived disk copy is unlinked after commit — owning tx with
+	// its bytes are catalog-only.
+	var oldPath string
+	if terr := withTx(s.db, func(tx *sql.Tx) error {
+		var err error
+		oldPath, err = insertPartTx(tx, objID, part, size,
+			hex.EncodeToString(mh.Sum(nil)), hex.EncodeToString(sh.Sum(nil)), dst)
+		if err != nil {
+			return err
+		}
+		return createArchiveRequest(tx, objID, pool, part)
+	}); terr != nil {
 		_ = os.Remove(dst)
-		return err
+		return terr
 	}
-	if err := createArchiveRequest(s.db, objID, pool, part); err != nil {
-		return err
+	if oldPath != "" && oldPath != dst {
+		_ = os.Remove(oldPath)
 	}
 	w.Header().Set("ETag", `"`+hex.EncodeToString(mh.Sum(nil))+`"`)
 	w.WriteHeader(http.StatusOK)
@@ -1026,38 +1050,41 @@ func (s *s3srv) completeMultipart(w http.ResponseWriter, r *http.Request, bucket
 	if _, err := getObjectIn(s.db, bucket, key); err == nil {
 		return errS3("OperationAborted", "key exists (v0 has no overwrite)", http.StatusConflict)
 	}
-	for _, p := range parts {
-		if !listed[p.Number] {
-			if _, err := s.db.Exec(`DELETE FROM archive_requests
-				WHERE object_id = $1 AND part_number = $2 AND state IN ('pending','assigned')`, objID, p.Number); err != nil {
-				return err
-			}
-			if _, err := s.db.Exec(`DELETE FROM tape_files WHERE object_id = $1 AND part_number = $2`, objID, p.Number); err != nil {
-				return err
-			}
-			if _, err := s.db.Exec(`DELETE FROM object_shards WHERE object_id = $1 AND part_number = $2`, objID, p.Number); err != nil {
-				return err
-			}
-			if p.DiskPath != "" {
-				_ = os.Remove(p.DiskPath)
-			}
-			if _, err := s.db.Exec(`DELETE FROM object_parts WHERE object_id = $1 AND part_number = $2`, objID, p.Number); err != nil {
-				return err
-			}
-		}
-	}
 	// S3-style multipart ETag: md5 of the concatenated binary part md5s.
 	h := md5.New()
-	var total int64
 	for _, lp := range req.Parts {
 		p := byNumber[lp.PartNumber]
 		raw, _ := hex.DecodeString(p.MD5)
 		h.Write(raw)
-		total += p.Size
 	}
 	etag := hex.EncodeToString(h.Sum(nil)) + "-" + strconv.Itoa(len(req.Parts))
-	if err := completeUpload(s.db, objID, etag); err != nil {
-		return err
+	// Drops for unlisted parts AND the completion update share one
+	// transaction (issues #34/#36/#37: a crash mid-loop left the
+	// catalog half-dropped; #37 moved the key check earlier, this makes
+	// the remainder atomic). File removals happen after commit — they
+	// are catalog-invisible either way.
+	oldPaths := []string{}
+	for _, p := range parts {
+		if !listed[p.Number] {
+			oldPaths = append(oldPaths, p.DiskPath)
+		}
+	}
+	if terr := withTx(s.db, func(tx *sql.Tx) error {
+		for _, p := range parts {
+			if !listed[p.Number] {
+				if err := dropPartTx(tx, objID, p.Number); err != nil {
+					return err
+				}
+			}
+		}
+		return completeUpload(tx, objID, etag)
+	}); terr != nil {
+		return terr
+	}
+	for _, op := range oldPaths {
+		if op != "" {
+			_ = os.Remove(op)
+		}
 	}
 	w.Header().Set("Content-Type", "application/xml")
 	return xml.NewEncoder(w).Encode(completeMultipartResult{

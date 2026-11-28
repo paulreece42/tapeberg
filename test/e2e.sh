@@ -170,6 +170,38 @@ rp=$($PSQL -c "SELECT r.pool FROM retrieve_requests r JOIN objects o ON o.id=r.o
 $PSQL -c "UPDATE retrieve_requests SET state='cancelled' WHERE state='pending' AND object_id=(SELECT id FROM objects WHERE key='e2e-file3')" >/dev/null
 echo "misqueued restore handed to the pool that holds its tape"
 
+say "crash recovery: stale in-flight jobs are reaped at startup (issue #33)"
+# A worker killed mid-job leaves rows in-flight forever: the archive
+# stays 'assigned' (object never reaches tape), the restore 'restoring'
+# (clients retry and get RestoreAlreadyInProgress for eternity).
+# Startup — holding the exclusive buffer lock — reaps stale in-flight
+# rows back to pending, and the same pass redoes them. Both fixtures
+# get assigned_at/updated_at 2-3h in the past, like a worker that died
+# before noon. (This section must not touch e2e-file1/2/3/4/5: the
+# manual-changer section below drives them.)
+dd if=/dev/urandom of="$WORK/src6" bs=1M count=5 status=none
+"$BIN" ingest "$WORK/src6" e2e-file6 >/dev/null
+$PSQL -q -c "UPDATE archive_requests SET state='assigned', tape_id=NULL, assigned_at=now() - interval '2 hours', updated_at=now() - interval '3 hours' WHERE object_id=(SELECT id FROM objects WHERE key='e2e-file6')" \
+  || fail "stale-archive fixture failed"
+out=$("$BIN" worker)
+echo "$out"
+echo "$out" | grep -q "recovered 1 stale archive" || fail "worker did not reap the stale archive job"
+wa=$($PSQL -c "SELECT r.state FROM archive_requests r JOIN objects o ON o.id=r.object_id WHERE o.key='e2e-file6'")
+[ "$wa" = written ] || fail "reaped stale archive was not written, state=$wa"
+[ "$($PSQL -c "SELECT storage_class FROM objects WHERE key='e2e-file6'")" = GLACIER ] || fail "recovered archive should be GLACIER on tape"
+# Now the same drill for a restore: e2e-file6 is on tape.
+"$BIN" restore e2e-file6 3   # pin 3 days: survives the expiry sweep below
+$PSQL -q -c "UPDATE retrieve_requests SET state='restoring', assigned_at=now() - interval '2 hours', updated_at=now() - interval '3 hours' WHERE object_id=(SELECT id FROM objects WHERE key='e2e-file6')" \
+  || fail "stale-restore fixture failed"
+out=$("$BIN" worker)
+echo "$out"
+echo "$out" | grep -q "1 stale restore" || fail "worker did not reap the stale restore job"
+s=$($PSQL -c "SELECT r.state FROM retrieve_requests r JOIN objects o ON o.id=r.object_id WHERE o.key='e2e-file6' ORDER BY r.id DESC LIMIT 1")
+[ "$s" = restored ] || fail "reaped stale restore was not redone, state=$s"
+"$BIN" get e2e-file6 > "$WORK/out6recovered"
+cmp "$WORK/src6" "$WORK/out6recovered" || fail "recovered restore reads wrong bytes"
+echo "stale archive and stale restore both reaped and redone in one pass; bytes verified"
+
 say "worker pass 3: pin expiry sweep"
 $PSQL -c "UPDATE retrieve_requests SET expires_at = now() - interval '1 hour' WHERE object_id=(SELECT id FROM objects WHERE key='e2e-file1')" >/dev/null
 "$BIN" worker

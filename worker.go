@@ -34,7 +34,17 @@ type Config struct {
 	Auth        string // auth backend: builtin (default), ldap/ad later
 	// RepackThreshold is the dead-bytes percentage that makes the
 	// worker rewrite a tape (CTA-style repack). 0 disables.
+	// RepackThreshold is the dead-bytes percentage that makes the
+	// worker rewrite a tape (CTA-style repack). 0 disables.
 	RepackThreshold int
+	// StaleJobMinutes: in-flight jobs (archive 'assigned', retrieve
+	// 'restoring') whose assigned_at is older than this are reaped back
+	// to 'pending' at worker startup — a dead worker's rows would only
+	// ever be recovered by manual SQL (issue #33). The startup holds the
+	// exclusive buffer lock, so reaped rows can only be ours or (on a
+	// future shared catalog) a long-dead remote node's. Defaults to 30;
+	// 0 reaps any in-flight row (single-worker purists).
+	StaleJobMinutes int
 	// UploadTTLDays is how long an open multipart upload may sit
 	// un-completed and un-aborted before the worker janitor
 	// tombstones it (S3 lifecycle "AbortIncompleteMultipartUpload").
@@ -85,6 +95,31 @@ func RunWorker(cfg Config) error {
 		return err
 	}
 	defer db.Close()
+	// Crash recovery (issue #33): the exclusive buffer lock is held and
+	// this rig has exactly one worker, so any row still in-flight is a
+	// job whose worker died — reset it and let this pass redo it. The
+	// staleness threshold keeps a future shared-catalog worker from
+	// stepping on another node's fresh jobs; updated_at backfills rows
+	// stranded before 0012 added assigned_at.
+	reap := func(table string) int64 {
+		q := fmt.Sprintf(
+			`UPDATE %s SET state='pending', assigned_at=NULL, updated_at=now()
+			  WHERE state=%s AND COALESCE(assigned_at, updated_at) < now() - interval '%d minutes'`,
+			table, "'"+map[string]string{"archive_requests": "assigned", "retrieve_requests": "restoring"}[table]+"'", cfg.StaleJobMinutes)
+		res, err := db.Exec(q)
+		if err != nil {
+			return -1
+		}
+		n, _ := res.RowsAffected()
+		return n
+	}
+	arn, rrn := reap("archive_requests"), reap("retrieve_requests")
+	if arn > 0 || rrn > 0 {
+		fmt.Printf("worker: recovered %d stale archive + %d stale restore job(s) from a dead worker\n", arn, rrn)
+		if n := NewNotifierFromEnv(); n.Enabled() {
+			_ = n.Notify(fmt.Sprintf("📼 tapeberg: reaped %d stale in-flight job(s) — previous worker died? (archive %d, restore %d)", arn+rrn, arn, rrn))
+		}
+	}
 	ch, err := newChanger(cfg)
 	if err != nil {
 		return err

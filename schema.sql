@@ -1,4 +1,4 @@
--- Tapeberg catalog schema, generated from db/migrations/ (0001 … 0011_s3_etag.sql — update when they change).
+-- Tapeberg catalog schema, generated from db/migrations/ (0001 … 0012_stale_jobs.sql — update when they change).
 --
 -- db/migrations/ remains the canonical history; this file is a
 -- convenience for reading the whole schema, diffing across versions, or
@@ -44,6 +44,7 @@ CREATE TABLE archive_requests (
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     pool text DEFAULT 'default'::text NOT NULL,
     part_number integer DEFAULT 1 NOT NULL,
+    assigned_at timestamp with time zone,
     CONSTRAINT archive_requests_state_check CHECK ((state = ANY (ARRAY['pending'::text, 'assigned'::text, 'written'::text, 'failed'::text, 'cancelled'::text])))
 );
 
@@ -183,6 +184,7 @@ CREATE TABLE retrieve_requests (
     restored_at timestamp with time zone,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     pool text DEFAULT 'default'::text NOT NULL,
+    assigned_at timestamp with time zone,
     CONSTRAINT retrieve_requests_pin_days_check CHECK (((pin_days >= 1) AND (pin_days <= 30))),
     CONSTRAINT retrieve_requests_state_check CHECK ((state = ANY (ARRAY['pending'::text, 'waiting_for_media'::text, 'restoring'::text, 'restored'::text, 'expired'::text, 'failed'::text, 'cancelled'::text])))
 );

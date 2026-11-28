@@ -394,6 +394,26 @@ if $AWS s3api create-multipart-upload --bucket vtl --key alice-mp-foreign >/dev/
   fail "alice must not initiate multipart into another tenant's bucket (uploads would squat foreign keys)"
 fi
 
+say "uploads pin their pool — re-binding mid-upload cannot split them (issue #39)"
+# alice-bkt is bound to vtl. Initiate an upload (pool pinned now), then
+# re-bind the bucket: parts must STILL queue for vtl. The old code
+# resolved the bucket's pool per UploadPart, so parts landing after the
+# rebind queued for the new pool — one object's tape files spanning two
+# pools, placementPool returning errSpansPools, every restore of it
+# failing forever.
+UPLL=$($AWS s3api create-multipart-upload --bucket alice-bkt --key alice-mp-pin --query UploadId --output text | tr -d '"')
+[ -n "$UPLL" ] || fail "pool-pin upload: initiate failed"
+BINDOUT=$("$BIN" bucket set-pool alice-bkt default 2>&1)
+echo "$BINDOUT"
+echo "$BINDOUT" | grep -q "upload(s) were pinned" || fail "set-pool did not report the open pinned upload: $BINDOUT"
+dd if=/dev/urandom of="$WORK/pin-p1" bs=1M count=6 status=none
+$AWS s3api upload-part --bucket alice-bkt --key alice-mp-pin --upload-id "$UPLL" --part-number 1 --body "$WORK/pin-p1" >/dev/null || fail "pool-pin upload part failed"
+pp=$($PSQL -c "SELECT DISTINCT r.pool FROM archive_requests r JOIN objects o ON o.id=r.object_id WHERE o.key='alice-mp-pin'")
+[ "$pp" = vtl ] || fail "part after rebind queued in '$pp', want the PINNED pool vtl"
+$AWS s3api abort-multipart-upload --bucket alice-bkt --key alice-mp-pin --upload-id "$UPLL" >/dev/null || fail "pool-pin upload cleanup failed"
+"$BIN" bucket set-pool alice-bkt vtl >/dev/null || fail "pool-pin: revert rebind failed"
+echo "rebind mid-upload: part kept the pinned pool (vtl); set-pool reports the open upload"
+
 say "suspend / unsuspend"
 "$BIN" user suspend alice
 if $AWS s3api list-buckets >/dev/null 2>&1; then

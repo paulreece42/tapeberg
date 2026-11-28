@@ -201,26 +201,37 @@ func createBucketCLI(db *sql.DB, name, pool, ownerUID string) error {
 // objects already on tape stay put (restores follow their tapes), and
 // archives already queued keep the pool they were queued for. It returns
 // how many queued archives that is, so the caller can say so.
-func setBucketPool(db *sql.DB, name, pool string) (queuedElsewhere int, err error) {
+func setBucketPool(db *sql.DB, name, pool string) (queuedElsewhere, openUploads int, err error) {
 	if ok, err := poolExists(db, pool); err != nil {
-		return 0, err
+		return 0, 0, err
 	} else if !ok {
-		return 0, fmt.Errorf("pool %q does not exist ('tapeberg pool ls'; create it with 'tapeberg pool add')", pool)
+		return 0, 0, fmt.Errorf("pool %q does not exist ('tapeberg pool ls'; create it with 'tapeberg pool add')", pool)
 	}
 	res, err := db.Exec(`UPDATE buckets SET pool = $2 WHERE name = $1`, name, pool)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		return 0, fmt.Errorf("bucket %q: %w", name, ErrNotFound)
+		return 0, 0, fmt.Errorf("bucket %q: %w", name, ErrNotFound)
 	}
+	// Queued archives keep their original pool (the note in main.go).
 	err = db.QueryRow(`
 		SELECT count(*) FROM archive_requests a
 		JOIN objects o ON o.id = a.object_id
 		JOIN buckets b ON b.id = o.bucket_id
 		WHERE b.name = $1 AND a.pool <> $2 AND a.state IN ('pending', 'assigned')`,
 		name, pool).Scan(&queuedElsewhere)
-	return queuedElsewhere, err
+	if err != nil {
+		return 0, 0, err
+	}
+	// Open multipart uploads were PINNED to the old pool at initiation
+	// (issue #39): their parts keep queueing there no matter what this
+	// rebind says — the CLI reports them instead of silently stranding
+	// the operator's mental model.
+	err = db.QueryRow(`SELECT count(*) FROM objects o
+		JOIN buckets b ON b.id = o.bucket_id
+		WHERE b.name = $1 AND o.upload_id IS NOT NULL`, name).Scan(&openUploads)
+	return queuedElsewhere, openUploads, err
 }
 
 // removeBucket drops a bucket that holds no object rows at all. Deleted

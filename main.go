@@ -883,7 +883,7 @@ func cmdBucket(cfg Config, args []string) error {
 		if len(args) != 3 {
 			return fmt.Errorf("usage: tapeberg bucket set-pool <name> <pool>")
 		}
-		queued, err := setBucketPool(db, args[1], args[2])
+		queued, openUploads, err := setBucketPool(db, args[1], args[2])
 		if err != nil {
 			return err
 		}
@@ -891,6 +891,11 @@ func cmdBucket(cfg Config, args []string) error {
 		fmt.Println("objects already on tape stay where they are (restores follow their tapes)")
 		if queued > 0 {
 			fmt.Printf("note: %d archive(s) already queued for this bucket keep their original pool\n", queued)
+		}
+		if openUploads > 0 {
+			// Issue #39: their parts queue into the pool pinned at
+			// initiation, so a rebind cannot split a live upload.
+			fmt.Printf("note: %d open multipart upload(s) were pinned to the old pool — their parts keep queueing there\n", openUploads)
 		}
 		return nil
 	case "rm":

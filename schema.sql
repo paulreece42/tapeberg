@@ -1,4 +1,4 @@
--- Tapeberg catalog schema, generated from db/migrations/ (0001 … 0012_stale_jobs.sql — update when they change).
+-- Tapeberg catalog schema, generated from db/migrations/ (0001 … 0013_upload_pool.sql — update when they change).
 --
 -- db/migrations/ remains the canonical history; this file is a
 -- convenience for reading the whole schema, diffing across versions, or
@@ -146,6 +146,7 @@ CREATE TABLE objects (
     ec_k integer,
     ec_m integer,
     etag text,
+    pool text,
     CONSTRAINT objects_storage_class_check CHECK ((storage_class = ANY (ARRAY['STANDARD'::text, 'GLACIER'::text, 'DEEP_ARCHIVE'::text])))
 );
 

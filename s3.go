@@ -856,7 +856,13 @@ func (s *s3srv) initiateMultipart(w http.ResponseWriter, r *http.Request, bucket
 		return err
 	}
 	uploadID := hex.EncodeToString(raw)
-	if err := createUpload(s.db, bucket, key, uploadID, s.user(r).ID); err != nil {
+	// Pin the bucket's pool NOW (issue #39): putPart will queue into the
+	// pinned pool no matter how the bucket is re-bound mid-upload.
+	pool, err := bucketPool(s.db, bucket)
+	if err != nil {
+		return notFoundOr(err, "NoSuchBucket", "bucket does not exist")
+	}
+	if err := createUpload(s.db, bucket, key, uploadID, s.user(r).ID, pool); err != nil {
 		return err
 	}
 	w.Header().Set("Content-Type", "application/xml")
@@ -866,18 +872,18 @@ func (s *s3srv) initiateMultipart(w http.ResponseWriter, r *http.Request, bucket
 
 // putPart streams one part to the buffer, hashes it (md5 = S3 part
 // ETag, sha256 = restore verifier), records it, and queues the part
-// for tape in the bucket's pool — the upload may still be streaming.
+// for tape — in the pool the upload PINNED at initiation, NOT the
+// bucket's current binding: re-binding mid-upload used to split the
+// object's tape files across two pools and brick its restores (note
+// the object's owner-orphaned parts still queue with their own pool;
+// issue #39).
 func (s *s3srv) putPart(w http.ResponseWriter, r *http.Request, bucket, key string) error {
-	pool, err := bucketPool(s.db, bucket)
-	if err != nil {
-		return notFoundOr(err, "NoSuchBucket", "bucket does not exist")
-	}
 	uploadID := r.URL.Query().Get("uploadId")
 	part, err := strconv.Atoi(r.URL.Query().Get("partNumber"))
 	if err != nil || part < 1 || part > 10000 {
 		return errS3("InvalidArgument", "partNumber must be 1-10000", http.StatusBadRequest)
 	}
-	objID, owner, err := objectByUpload(s.db, bucket, key, uploadID)
+	objID, owner, pool, err := objectByUpload(s.db, bucket, key, uploadID)
 	if err != nil {
 		return notFoundOr(err, "NoSuchUpload", "upload does not exist")
 	}
@@ -972,7 +978,7 @@ type completeMultipartResult struct {
 
 func (s *s3srv) completeMultipart(w http.ResponseWriter, r *http.Request, bucket, key string) error {
 	uploadID := r.URL.Query().Get("uploadId")
-	objID, owner, err := objectByUpload(s.db, bucket, key, uploadID)
+	objID, owner, _, err := objectByUpload(s.db, bucket, key, uploadID)
 	if err != nil {
 		return notFoundOr(err, "NoSuchUpload", "upload does not exist")
 	}
@@ -1096,7 +1102,7 @@ func (s *s3srv) completeMultipart(w http.ResponseWriter, r *http.Request, bucket
 
 func (s *s3srv) abortMultipart(w http.ResponseWriter, r *http.Request, bucket, key string) error {
 	uploadID := r.URL.Query().Get("uploadId")
-	objID, owner, err := objectByUpload(s.db, bucket, key, uploadID)
+	objID, owner, _, err := objectByUpload(s.db, bucket, key, uploadID)
 	if err != nil {
 		return notFoundOr(err, "NoSuchUpload", "upload does not exist")
 	}
@@ -1137,7 +1143,7 @@ type listPartsResult struct {
 
 func (s *s3srv) listUploadParts(w http.ResponseWriter, r *http.Request, bucket, key string) error {
 	uploadID := r.URL.Query().Get("uploadId")
-	objID, owner, err := objectByUpload(s.db, bucket, key, uploadID)
+	objID, owner, _, err := objectByUpload(s.db, bucket, key, uploadID)
 	if err != nil {
 		return notFoundOr(err, "NoSuchUpload", "upload does not exist")
 	}

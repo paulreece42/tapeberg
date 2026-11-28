@@ -63,6 +63,14 @@ buffer = /var/lib/tapeberg
 #part_min_bytes = 5242880
 #part_max_bytes = 5368709120
 
+# In-flight jobs (archives 'assigned', restores 'restoring') from a
+# worker that DIED are reaped back to 'pending' after this many minutes
+# — at the next worker startup, which re-runs them in the same pass.
+# Events and a log line announce the reap. 0 reaps any in-flight row
+# (right for single-worker rigs); raise it only if a second worker will
+# one day share the catalog.
+#stale_job_minutes = 30
+
 # ---- S3 endpoint (`tapeberg s3`) --------------------------------------
 # Listen address (a positional argument on the command line overrides).
 #s3_listen = :7333

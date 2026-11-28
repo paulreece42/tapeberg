@@ -88,6 +88,7 @@ mtx -f $CH unload <slot> 0   # repeat for 1, 2, …
 | `UPLOAD_TTL_DAYS` | `7` | Multipart uploads neither completed nor aborted after this many days are tombstoned. `0` disables the sweep. |
 | `PART_MIN_BYTES` | `5242880` (5 MiB) | Smallest accepted multipart part (all but the last), enforced at CompleteMultipartUpload. Raise it on real tape (64–128 MiB keeps LTO streaming). |
 | `PART_MAX_BYTES` | `5368709120` (5 GiB) | Largest accepted part, rejected per UploadPart. |
+| `STALE_JOB_MINUTES` | `30` | In-flight jobs (archives `assigned`, restores `restoring`) whose `assigned_at` is older than this are reaped back to `pending` at worker startup, which then redoes them in the same pass. Recovers a worker killed mid-job without manual SQL; `0` reaps any in-flight row (single-worker rigs). |
 
 ## S3 endpoint
 

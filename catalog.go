@@ -338,12 +338,12 @@ func pickTape(db *sql.DB, pool string, size int64) (*Tape, error) {
 }
 
 func setArchiveAssigned(db *sql.DB, reqID, tapeID int64) error {
-	_, err := db.Exec(`UPDATE archive_requests SET state='assigned', tape_id=$2, updated_at=now() WHERE id=$1`, reqID, tapeID)
+	_, err := db.Exec(`UPDATE archive_requests SET state='assigned', tape_id=$2, assigned_at=now(), updated_at=now() WHERE id=$1`, reqID, tapeID)
 	return err
 }
 
 func setArchivePending(db *sql.DB, reqID int64) error {
-	_, err := db.Exec(`UPDATE archive_requests SET state='pending', tape_id=NULL, updated_at=now() WHERE id=$1`, reqID)
+	_, err := db.Exec(`UPDATE archive_requests SET state='pending', tape_id=NULL, assigned_at=NULL, updated_at=now() WHERE id=$1`, reqID)
 	return err
 }
 
@@ -1001,7 +1001,10 @@ func objectTapeFile(db *sql.DB, objectID int64) (*TapeFileLoc, error) {
 }
 
 func setRetrieveState(db *sql.DB, reqID int64, state string) error {
-	_, err := db.Exec(`UPDATE retrieve_requests SET state=$2, updated_at=now() WHERE id=$1`, reqID, state)
+	// assigned_at marks the transition INTO an in-flight state; the
+	// worker's stale-job reaper keys off it (issue #33). Going back to
+	// pending (or serving a terminal state) clears it.
+	_, err := db.Exec(`UPDATE retrieve_requests SET state=$2, assigned_at=CASE WHEN $2='restoring' THEN now() ELSE NULL END, updated_at=now() WHERE id=$1`, reqID, state)
 	return err
 }
 

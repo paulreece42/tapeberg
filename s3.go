@@ -447,7 +447,10 @@ func (s *s3srv) serveBucket(w http.ResponseWriter, r *http.Request, bucket strin
 		return nil
 	case http.MethodHead:
 		owner, err := bucketOwner(s.db, bucket)
-		if err != nil || !canSee(s.user(r), owner) {
+		if err != nil {
+			return notFoundOr(err, "NoSuchBucket", "bucket does not exist")
+		}
+		if !canSee(s.user(r), owner) {
 			return errS3("NoSuchBucket", "bucket does not exist", http.StatusNotFound)
 		}
 		w.WriteHeader(http.StatusOK)
@@ -463,7 +466,10 @@ func (s *s3srv) serveBucket(w http.ResponseWriter, r *http.Request, bucket strin
 			return nil
 		}
 		owner, err := bucketOwner(s.db, bucket)
-		if err != nil || !canSee(s.user(r), owner) {
+		if err != nil {
+			return notFoundOr(err, "NoSuchBucket", "bucket does not exist")
+		}
+		if !canSee(s.user(r), owner) {
 			return errS3("NoSuchBucket", "bucket does not exist", http.StatusNotFound)
 		}
 		objs, err := listObjectsFor(s.db, bucket, r.URL.Query().Get("prefix"), s.user(r))
@@ -515,16 +521,31 @@ func (s *s3srv) serveObject(w http.ResponseWriter, r *http.Request, bucket, key 
 	}
 }
 
+// notFoundOr maps a catalog lookup failure to S3's "doesn't exist"
+// error — but only for genuine ErrNotFound. Anything else (catalog
+// down, a constraint, a timeout) must surface as InternalError: the
+// old blanket 404/204 made DeleteObject report success for nothing and
+// served 404s for fully real objects during a blip (issue #35).
+func notFoundOr(err error, code, msg string) error {
+	if errors.Is(err, ErrNotFound) {
+		return errS3(code, msg, http.StatusNotFound)
+	}
+	return errS3("InternalError", err.Error(), http.StatusInternalServerError)
+}
+
 func (s *s3srv) putObject(w http.ResponseWriter, r *http.Request, bucket, key string) error {
 	u := s.user(r)
 	owner, err := bucketOwner(s.db, bucket)
-	if err != nil || !canSee(u, owner) {
+	if err != nil {
+		return notFoundOr(err, "NoSuchBucket", "bucket does not exist")
+	}
+	if !canSee(u, owner) {
 		return errS3("NoSuchBucket", "bucket does not exist", http.StatusNotFound)
 	}
 	// The bucket's bound pool decides which tape set archives this object.
 	pool, err := bucketPool(s.db, bucket)
 	if err != nil {
-		return errS3("NoSuchBucket", "bucket does not exist", http.StatusNotFound)
+		return notFoundOr(err, "NoSuchBucket", "bucket does not exist")
 	}
 	obj, err := ingestStream(s.db, s.cfg, bucket, key, requestBody(r), pool, u.ID)
 	if err != nil {
@@ -560,7 +581,7 @@ func setObjectHeaders(w http.ResponseWriter, obj *Object, st string, exp time.Ti
 func (s *s3srv) getObject(w http.ResponseWriter, r *http.Request, bucket, key string) error {
 	obj, err := getObjectIn(s.db, bucket, key)
 	if err != nil {
-		return errS3("NoSuchKey", "key does not exist", http.StatusNotFound)
+		return notFoundOr(err, "NoSuchKey", "key does not exist")
 	}
 	// Tenancy: only the owner or an admin reads an object.
 	if !canSee(s.user(r), obj.OwnerID) {
@@ -665,6 +686,9 @@ func (s *s3srv) getMultipart(w http.ResponseWriter, r *http.Request, obj *Object
 func (s *s3srv) deleteObject(w http.ResponseWriter, r *http.Request, bucket, key string) error {
 	obj, err := getObjectIn(s.db, bucket, key)
 	if err != nil {
+		if !errors.Is(err, ErrNotFound) {
+			return err // transient catalog failure is NOT "already gone"
+		}
 		w.WriteHeader(http.StatusNoContent) // never existed (or already deleted)
 		return nil
 	}
@@ -687,7 +711,7 @@ func (s *s3srv) deleteObject(w http.ResponseWriter, r *http.Request, bucket, key
 func (s *s3srv) restoreObject(w http.ResponseWriter, r *http.Request, bucket, key string) error {
 	obj, err := getObjectIn(s.db, bucket, key)
 	if err != nil {
-		return errS3("NoSuchKey", "key does not exist", http.StatusNotFound)
+		return notFoundOr(err, "NoSuchKey", "key does not exist")
 	}
 	if !canSee(s.user(r), obj.OwnerID) {
 		return errS3("AccessDenied", "access denied", http.StatusForbidden)
@@ -724,7 +748,7 @@ func (s *s3srv) restoreObject(w http.ResponseWriter, r *http.Request, bucket, ke
 	// where the object's tapes are (createRetrieveRequest).
 	pool, err := bucketPool(s.db, bucket)
 	if err != nil {
-		return errS3("NoSuchBucket", "bucket does not exist", http.StatusNotFound)
+		return notFoundOr(err, "NoSuchBucket", "bucket does not exist")
 	}
 	if _, err := createRetrieveRequest(s.db, obj.ID, days, pool); err != nil {
 		return err
@@ -816,7 +840,10 @@ func (s *s3srv) initiateMultipart(w http.ResponseWriter, r *http.Request, bucket
 	// owner — which is the caller — so initiation is the gate.
 	u := s.user(r)
 	owner, err := bucketOwner(s.db, bucket)
-	if err != nil || !canSee(u, owner) {
+	if err != nil {
+		return notFoundOr(err, "NoSuchBucket", "bucket does not exist")
+	}
+	if !canSee(u, owner) {
 		return errS3("NoSuchBucket", "bucket does not exist", http.StatusNotFound)
 	}
 	// v0 has no overwrite; the upload's placeholder object row would
@@ -844,7 +871,7 @@ func (s *s3srv) initiateMultipart(w http.ResponseWriter, r *http.Request, bucket
 func (s *s3srv) putPart(w http.ResponseWriter, r *http.Request, bucket, key string) error {
 	pool, err := bucketPool(s.db, bucket)
 	if err != nil {
-		return errS3("NoSuchBucket", "bucket does not exist", http.StatusNotFound)
+		return notFoundOr(err, "NoSuchBucket", "bucket does not exist")
 	}
 	uploadID := r.URL.Query().Get("uploadId")
 	part, err := strconv.Atoi(r.URL.Query().Get("partNumber"))
@@ -853,7 +880,7 @@ func (s *s3srv) putPart(w http.ResponseWriter, r *http.Request, bucket, key stri
 	}
 	objID, owner, err := objectByUpload(s.db, bucket, key, uploadID)
 	if err != nil {
-		return errS3("NoSuchUpload", "upload does not exist", http.StatusNotFound)
+		return notFoundOr(err, "NoSuchUpload", "upload does not exist")
 	}
 	if !canSee(s.user(r), owner) {
 		return errS3("AccessDenied", "access denied", http.StatusForbidden)
@@ -923,7 +950,7 @@ func (s *s3srv) completeMultipart(w http.ResponseWriter, r *http.Request, bucket
 	uploadID := r.URL.Query().Get("uploadId")
 	objID, owner, err := objectByUpload(s.db, bucket, key, uploadID)
 	if err != nil {
-		return errS3("NoSuchUpload", "upload does not exist", http.StatusNotFound)
+		return notFoundOr(err, "NoSuchUpload", "upload does not exist")
 	}
 	if !canSee(s.user(r), owner) {
 		return errS3("AccessDenied", "access denied", http.StatusForbidden)
@@ -1044,7 +1071,7 @@ func (s *s3srv) abortMultipart(w http.ResponseWriter, r *http.Request, bucket, k
 	uploadID := r.URL.Query().Get("uploadId")
 	objID, owner, err := objectByUpload(s.db, bucket, key, uploadID)
 	if err != nil {
-		return errS3("NoSuchUpload", "upload does not exist", http.StatusNotFound)
+		return notFoundOr(err, "NoSuchUpload", "upload does not exist")
 	}
 	if !canSee(s.user(r), owner) {
 		return errS3("AccessDenied", "access denied", http.StatusForbidden)
@@ -1085,7 +1112,7 @@ func (s *s3srv) listUploadParts(w http.ResponseWriter, r *http.Request, bucket, 
 	uploadID := r.URL.Query().Get("uploadId")
 	objID, owner, err := objectByUpload(s.db, bucket, key, uploadID)
 	if err != nil {
-		return errS3("NoSuchUpload", "upload does not exist", http.StatusNotFound)
+		return notFoundOr(err, "NoSuchUpload", "upload does not exist")
 	}
 	if !canSee(s.user(r), owner) {
 		return errS3("AccessDenied", "access denied", http.StatusForbidden)

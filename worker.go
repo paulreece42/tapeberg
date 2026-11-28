@@ -309,7 +309,13 @@ func restoreOne(db *sql.DB, cfg Config, ch Changer, req *RetrieveReq) error {
 	}
 	tf, err := objectTapeFile(db, req.ObjectID)
 	if err != nil {
-		if ferr := failRetrieve(db, req.ID, err.Error()); ferr != nil {
+		// Typed not-found: genuinely no placement (upload incomplete?).
+		// Anything else is transient — leave the request pending for the
+		// next pass, like drainRestores does for placements (issue #35).
+		if !errors.Is(err, ErrNotFound) {
+			return err
+		}
+		if ferr := failRetrieve(db, req.ID, "no tape placement (upload incomplete?)"); ferr != nil {
 			return ferr
 		}
 		return nil

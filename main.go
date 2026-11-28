@@ -718,8 +718,11 @@ func cmdRm(cfg Config, bucket, key string) error {
 	defer db.Close()
 	obj, err := getObjectIn(db, bucket, key)
 	if err != nil {
-		fmt.Printf("%s: already gone (no such object)\n", key)
-		return nil
+		if errors.Is(err, ErrNotFound) {
+			fmt.Printf("%s: already gone (no such object)\n", key)
+			return nil
+		}
+		return err // transient catalog failure is not "already gone"
 	}
 	files, err := softDeleteObject(db, obj.ID)
 	if err != nil {

@@ -806,31 +806,41 @@ type PartRow struct {
 	DiskPath string // "" when tape-only
 }
 
-func createUpload(db *sql.DB, bucket, key, uploadID string, owner int64) error {
+// createUpload opens a multipart upload: the object row exists up
+// front (key reserved, tenancy resolves against it) and — issue #39 —
+// it PINS the bucket's current pool: putPart reads the pinned pool
+// instead of re-resolving the bucket per part, so re-binding the
+// bucket mid-upload cannot split one object's tape files across two
+// pools (which made every restore of it fail on errSpansPools).
+func createUpload(db dbi, bucket, key, uploadID string, owner int64, pool string) error {
 	bid, err := bucketIDByName(db, bucket)
 	if err != nil {
 		return err
 	}
-	_, err = db.Exec(`INSERT INTO objects (bucket_id, key, size_bytes, storage_class, upload_id, owner_id)
-		VALUES ($1, $2, 0, 'STANDARD', $3, NULLIF($4, 0))`, bid, key, uploadID, owner)
+	_, err = db.Exec(`INSERT INTO objects (bucket_id, key, size_bytes, storage_class, upload_id, owner_id, pool)
+		VALUES ($1, $2, 0, 'STANDARD', $3, NULLIF($4, 0), $5)`, bid, key, uploadID, owner, pool)
 	return err
 }
 
-// objectByUpload resolves an open upload to its object id and owner
-// (tenancy: parts may only be managed by the upload's owner or admins).
-func objectByUpload(db *sql.DB, bucket, key, uploadID string) (int64, int64, error) {
+// objectByUpload resolves an open upload to its object id, owner and
+// POOL — the pool the upload pinned at initiation (issue #39), falling
+// back to the bucket's current pool for pre-0013 rows. Tenancy: parts
+// may only be managed by the upload's owner or admins.
+func objectByUpload(db *sql.DB, bucket, key, uploadID string) (int64, int64, string, error) {
 	bid, err := bucketIDByName(db, bucket)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, "", err
 	}
 	var id int64
 	var owner sql.NullInt64
-	err = db.QueryRow(`SELECT id, owner_id FROM objects
-		WHERE bucket_id = $1 AND key = $2 AND upload_id = $3`, bid, key, uploadID).Scan(&id, &owner)
+	var pool string
+	err = db.QueryRow(`SELECT o.id, o.owner_id, COALESCE(o.pool, b.pool)
+		FROM objects o JOIN buckets b ON b.id = o.bucket_id
+		WHERE o.bucket_id = $1 AND o.key = $2 AND o.upload_id = $3`, bid, key, uploadID).Scan(&id, &owner, &pool)
 	if errors.Is(err, sql.ErrNoRows) {
-		return 0, 0, fmt.Errorf("upload %q %q: %w", uploadID, key, ErrNotFound)
+		return 0, 0, "", fmt.Errorf("upload %q %q: %w", uploadID, key, ErrNotFound)
 	}
-	return id, owner.Int64, err
+	return id, owner.Int64, pool, err
 }
 
 // insertPart records an uploaded part. Re-uploading a part number

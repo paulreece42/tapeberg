@@ -1,0 +1,11 @@
+-- 0013_upload_pool.sql
+--
+-- Issue #39: multipart parts resolved the bucket's pool per UploadPart.
+-- Rebinding the bucket mid-upload queued later parts into the NEW pool —
+-- the object's tape files spanned two pools, placementPool returned
+-- errSpansPools, and every restore of that object failed forever ('tape
+-- mv' refuses to create exactly this state; the ingest side could).
+-- Uploads now pin the bucket's pool at CreateMultipartUpload; the
+-- object row carries it. Nullable: pre-0013 open uploads (and part
+-- lookups against legacy rows) fall back to the bucket's current pool.
+ALTER TABLE objects ADD COLUMN pool text;

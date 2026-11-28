@@ -593,6 +593,42 @@ WSTATE=$($PSQL -c "SELECT state FROM archive_requests WHERE object_id=(SELECT id
 $PSQL >/dev/null -c "UPDATE tapes SET written_bytes = written_bytes - 100000000000 WHERE pool_id=(SELECT id FROM tape_pools WHERE name='vtl')" \
   || fail "no-media fixture: deflation failed"
 
+say "EC multipart: re-uploading a part must reset its shard verifiers (issue #34)"
+# Two-part multipart in the EC pool, both parts archived to tape, then
+# part 1 RE-uploaded with different bytes and re-archived. insertPart's
+# old path cleaned the part's queue and tape rows but NOT object_shards:
+# the new stripe's verifiers lost their ON CONFLICT to the first
+# upload's, and ecRestorePart then rejected every shard of part 1 —
+# the completed object permanently unrestorable.
+dd if=/dev/urandom of="$WORK/ecp1" bs=1M count=6 status=none
+dd if=/dev/urandom of="$WORK/ecp2" bs=1M count=6 status=none
+UPEC=$($AWS s3api create-multipart-upload --bucket vtl --key s3e2e-ec-mpu --query UploadId --output text | tr -d '"')
+[ -n "$UPEC" ] || fail "EC multipart: initiate failed"
+$AWS s3api upload-part --bucket vtl --key s3e2e-ec-mpu --upload-id "$UPEC" --part-number 1 --body "$WORK/ecp1" >/dev/null || fail "EC multipart: part 1 failed"
+$AWS s3api upload-part --bucket vtl --key s3e2e-ec-mpu --upload-id "$UPEC" --part-number 2 --body "$WORK/ecp2" >/dev/null || fail "EC multipart: part 2 failed"
+"$BIN" worker >/dev/null || fail "worker failed archiving EC multipart parts"
+NSH=$($PSQL -c "SELECT count(*) FROM object_shards s JOIN objects o ON o.id=s.object_id WHERE o.key='s3e2e-ec-mpu'")
+[ "$NSH" = 6 ] || fail "expected 6 EC verifier rows for 2 parts, got $NSH"
+dd if=/dev/urandom of="$WORK/ecp1b" bs=1M count=6 status=none
+$AWS s3api upload-part --bucket vtl --key s3e2e-ec-mpu --upload-id "$UPEC" --part-number 1 --body "$WORK/ecp1b" >/dev/null || fail "EC multipart: part 1 re-upload failed"
+"$BIN" worker >/dev/null || fail "worker failed re-archiving the re-uploaded part"
+# The re-upload dropped the old verifier rows and re-queued — exactly
+# one verifier set for part 1 must exist now, and it must be the NEW
+# bytes' (on the old code the stale shas won the ON CONFLICT race).
+NSH=$($PSQL -c "SELECT count(*) FROM object_shards s JOIN objects o ON o.id=s.object_id WHERE o.key='s3e2e-ec-mpu' AND s.part_number=1")
+[ "$NSH" = 3 ] || fail "part 1 verifier rows after re-upload: $NSH, want exactly 3"
+E1B=$($AWS s3api list-parts --bucket vtl --key s3e2e-ec-mpu --upload-id "$UPEC" --query "Parts[?PartNumber==\`1\`].ETag" --output text | tr -d '"')
+E2=$($AWS s3api list-parts --bucket vtl --key s3e2e-ec-mpu --upload-id "$UPEC" --query "Parts[?PartNumber==\`2\`].ETag" --output text | tr -d '"')
+$AWS s3api complete-multipart-upload --bucket vtl --key s3e2e-ec-mpu --upload-id "$UPEC" --multipart-upload "Parts=[{ETag=$E1B,PartNumber=1},{ETag=$E2,PartNumber=2}]" >/dev/null || fail "EC multipart complete failed"
+$AWS s3api restore-object --bucket vtl --key s3e2e-ec-mpu --restore-request Days=1 >/dev/null || fail "EC multipart restore request failed"
+"$BIN" worker >/dev/null || fail "worker failed the EC multipart restore"
+RSTATE=$($PSQL -c "SELECT state || ': ' || COALESCE(error,'') FROM retrieve_requests r JOIN objects o ON o.id=r.object_id WHERE o.key='s3e2e-ec-mpu' ORDER BY r.id DESC LIMIT 1")
+[ "${RSTATE%%:*}" = restored ] || fail "EC multipart restore ended '$RSTATE'"
+$AWS s3api get-object --bucket vtl --key s3e2e-ec-mpu "$WORK/ecmpu-out" >/dev/null || fail "get of EC multipart object failed"
+cat "$WORK/ecp1b" "$WORK/ecp2" > "$WORK/ecmpu-want"
+cmp "$WORK/ecmpu-want" "$WORK/ecmpu-out" || fail "EC multipart after part re-upload restores WRONG bytes — stale shard verifiers survived (issue #34)"
+echo "re-uploaded EC part: verifiers reset, restore byte-identical"
+
 kill $SRV_PID 2>/dev/null || true
 SRV_PID=""
 printf '\nS3 E2E PASS — Glacier wire contract verified via awscli\n'

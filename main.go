@@ -245,13 +245,28 @@ func ingestStream(db *sql.DB, cfg Config, bucket, key string, r io.Reader, pool 
 		os.Remove(dst)
 		return nil, err
 	}
-	obj, err := insertObject(db, bucket, key, size, hex.EncodeToString(h.Sum(nil)),
-		hex.EncodeToString(mh.Sum(nil)), dst, owner)
+	obj, err := func() (*Object, error) {
+		var obj *Object
+		// Object row + its archive request in ONE transaction (issue
+		// #36): the old two autocommit statements could crash between
+		// them, stranding a live STANDARD object on the buffer with no
+		// queue entry — the key taken (its own insert committed), a
+		// client retry 409, and nothing ever reaching tape.
+		if err := withTx(db, func(tx *sql.Tx) error {
+			o, err := insertObject(tx, bucket, key, size, hex.EncodeToString(h.Sum(nil)),
+				hex.EncodeToString(mh.Sum(nil)), dst, owner)
+			if err != nil {
+				return err
+			}
+			obj = o
+			return createArchiveRequest(tx, o.ID, pool, 1)
+		}); err != nil {
+			return nil, err
+		}
+		return obj, nil
+	}()
 	if err != nil {
 		os.Remove(dst)
-		return nil, err
-	}
-	if err := createArchiveRequest(db, obj.ID, pool, 1); err != nil {
 		return nil, err
 	}
 	return obj, nil
